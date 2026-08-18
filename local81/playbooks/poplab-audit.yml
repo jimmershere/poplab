@@ -1,0 +1,28 @@
+# Local81 playbook — read-only audit of every poplab-managed host.
+# Local81 is agentless (SSH + rsync), so nothing needs installing on the target.
+name: poplab-audit
+description: Read-only system audit; collects the scored report back to the controller.
+hosts:
+  - name: n155
+    address: "{{ N155_HOST }}"
+    user: "{{ N155_USER }}"
+vars:
+  repo_src: "./"
+  repo_dst: "/opt/poplab"
+tasks:
+  - name: sync poplab to the target
+    sync:
+      src: "{{ repo_src }}"
+      dest: "{{ repo_dst }}"
+      exclude: [".git", "docs/research", "*.log"]
+      delete: true
+
+  - name: run audit
+    shell: "cd {{ repo_dst }} && NO_COLOR=1 ./bin/poplab audit"
+    register: audit_out
+    ignore_errors: false
+
+  - name: persist the report on the controller
+    fetch:
+      src: "stdout:audit_out"
+      dest: "./reports/{{ host.name }}-audit-{{ now }}.txt"

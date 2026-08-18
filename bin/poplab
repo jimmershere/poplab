@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# poplab — Pop!_OS 24.04 tuning harness for the NIMO N155 (Ryzen 7 6800H / 680M).
+#
+#   poplab audit                 read-only inspection + score          (no root needed)
+#   poplab plan                  show every change that apply would make (dry run)
+#   poplab apply                 commit changes (needs sudo)
+#   poplab verify                assert the changes stuck
+#   poplab soak [seconds]        sustained-load test with clock/thermal sampling
+#   poplab rollback [run-id]     restore files from a previous apply
+#   poplab runs                  list previous apply runs
+#
+# Flags:
+#   --only 10,30,50   run just these modules
+#   --skip 95         exclude modules
+#   --aggressive      enable risky modules (ryzenadj power limits, userns opt-out)
+#   --yes             never prompt
+#   --quiet
+set -o errexit -o nounset -o pipefail
+
+POPLAB_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export POPLAB_ROOT
+# shellcheck source=../lib/common.sh
+source "$POPLAB_ROOT/lib/common.sh"
+
+ONLY=""; SKIP=""
+
+usage() { sed -n '2,22p' "$0" | sed 's/^# \?//'; }
+
+modules() {
+  local m base id
+  for m in "$POPLAB_ROOT"/scripts/[0-9]*.sh; do
+    base="$(basename "$m")"; id="${base%%-*}"
+    [[ "$id" == "00" || "$id" == "98" || "$id" == "99" ]] && continue
+    if [[ -n "$ONLY" ]] && [[ ",$ONLY," != *",$id,"* ]]; then continue; fi
+    if [[ -n "$SKIP" ]] && [[ ",$SKIP," == *",$id,"* ]]; then continue; fi
+    printf '%s\n' "$m"
+  done
+}
+
+run_modules() {
+  local m rc
+  for m in $(modules); do
+    rc=0
+    bash "$m" || rc=$?
+    [[ "$rc" -ne 0 ]] && err "module $(basename "$m") exited $rc — continuing with the rest"
+  done
+  return 0
+}
+
+cmd_rollback() {
+  require_root
+  local run_id="${1:-}"
+  if [[ -z "$run_id" ]]; then
+    run_id="$(ls -1 "$POPLAB_BACKUP_ROOT" 2>/dev/null | sort | tail -n1 || true)"
+  fi
+  [[ -n "$run_id" ]] || die "no runs found under $POPLAB_BACKUP_ROOT"
+  local man="$POPLAB_BACKUP_ROOT/$run_id/manifest.tsv"
+  [[ -f "$man" ]] || die "no manifest for run $run_id"
+  head1 "rollback run $run_id"
+  local action target backup n=0
+  while IFS=$'\t' read -r action target backup; do
+    [[ "$action" == "action" ]] && continue
+    case "$action" in
+      MODIFIED)
+        if [[ -f "$backup" ]]; then cp -a -- "$backup" "$target"; ok "restored $target"; n=$((n+1)); fi ;;
+      CREATED)
+        if [[ -e "$target" ]]; then rm -f -- "$target"; ok "removed $target (created by poplab)"; n=$((n+1)); fi ;;
+    esac
+  done < "$man"
+  info "$n path(s) reverted"
+  warn "kernel cmdline entries added via kernelstub are NOT auto-reverted."
+  warn "Inspect and edit by hand:  sudo kernelstub -p   /  sudo kernelstub -d '<param>'"
+  warn "Reload the rest with:      sudo sysctl --system && sudo systemctl daemon-reload && sudo udevadm control --reload"
+}
+
+cmd_runs() {
+  head1 "apply runs"
+  local d
+  for d in "$POPLAB_BACKUP_ROOT"/*/; do
+    [[ -d "$d" ]] || continue
+    printf '  %-24s %s file(s)\n' "$(basename "$d")" "$(( $(wc -l < "$d/manifest.tsv" 2>/dev/null || echo 1) - 1 ))"
+  done
+}
+
+main() {
+  local cmd="${1:-audit}"; shift || true
+  local rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --only)       ONLY="$2"; shift 2 ;;
+      --skip)       SKIP="$2"; shift 2 ;;
+      --aggressive) POPLAB_AGGRESSIVE=1; shift ;;
+      --yes|-y)     POPLAB_YES=1; shift ;;
+      --quiet|-q)   POPLAB_QUIET=1; shift ;;
+      --apply)      POPLAB_APPLY=1; shift ;;
+      -h|--help)    usage; exit 0 ;;
+      *)            rest+=("$1"); shift ;;
+    esac
+  done
+  POPLAB_TALLY="$(mktemp -t poplab-tally.XXXXXX)"
+  trap 'rm -f "$POPLAB_TALLY"' EXIT
+  export POPLAB_AGGRESSIVE POPLAB_YES POPLAB_QUIET POPLAB_RUN_ID POPLAB_MANIFEST POPLAB_BACKUP_ROOT POPLAB_TALLY
+
+  case "$cmd" in
+    audit)  POPLAB_APPLY=0; export POPLAB_APPLY; bash "$POPLAB_ROOT/scripts/00-audit.sh" ;;
+    plan)   POPLAB_APPLY=0; export POPLAB_APPLY; run_modules; poplab_summary ;;
+    apply)
+      require_root
+      POPLAB_APPLY=1; export POPLAB_APPLY
+      mkdir -p "$POPLAB_BACKUP_ROOT/$POPLAB_RUN_ID" "$POPLAB_REPORT_DIR"
+      head1 "poplab apply — run $POPLAB_RUN_ID"
+      info "backups: $POPLAB_BACKUP_ROOT/$POPLAB_RUN_ID"
+      run_modules
+      poplab_summary
+      log ""
+      log "Roll back everything with:  sudo $0 rollback $POPLAB_RUN_ID"
+      log "Then verify with:           $0 verify"
+      ;;
+    verify) bash "$POPLAB_ROOT/scripts/99-verify.sh" ;;
+    soak)   bash "$POPLAB_ROOT/scripts/98-soak.sh" "${rest[0]:-300}" ;;
+    rollback) cmd_rollback "${rest[0]:-}" ;;
+    runs)   cmd_runs ;;
+    -h|--help|help) usage ;;
+    *) err "unknown command: $cmd"; usage; exit 64 ;;
+  esac
+}
+main "$@"

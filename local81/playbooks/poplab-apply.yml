@@ -1,0 +1,47 @@
+# Local81 playbook — plan, gate, apply, verify. Never applies without a plan first.
+name: poplab-apply
+description: Plan -> confirm -> apply -> verify, with rollback instructions captured.
+hosts:
+  - name: n155
+    address: "{{ N155_HOST }}"
+    user: "{{ N155_USER }}"
+vars:
+  repo_dst: "/opt/poplab"
+  modules: "10,20,30,40,50,60,70,80,90"     # 95 is aggressive; add deliberately
+  aggressive: false
+tasks:
+  - name: sync poplab
+    sync: { src: "./", dest: "{{ repo_dst }}", exclude: [".git"], delete: true }
+
+  - name: dry run
+    shell: "cd {{ repo_dst }} && NO_COLOR=1 ./bin/poplab plan --only {{ modules }} --yes"
+    register: plan_out
+
+  - name: gate on human review
+    pause:
+      prompt: "Review the plan above. Continue with apply on {{ host.name }}?"
+      when: "{{ not auto_approve | default(false) }}"
+
+  - name: apply
+    shell: "cd {{ repo_dst }} && NO_COLOR=1 sudo ./bin/poplab apply --only {{ modules }} --yes{{ ' --aggressive' if aggressive else '' }}"
+    become: true
+    register: apply_out
+
+  - name: capture run id for rollback
+    shell: "ls -1 /var/lib/poplab/backups | sort | tail -n1"
+    become: true
+    register: run_id
+
+  - name: verify
+    shell: "cd {{ repo_dst }} && NO_COLOR=1 ./bin/poplab verify"
+    register: verify_out
+    ignore_errors: true
+
+  - name: report
+    debug:
+      msg: |
+        host:      {{ host.name }}
+        run id:    {{ run_id.stdout }}
+        verify rc: {{ verify_out.rc }}
+        rollback:  sudo {{ repo_dst }}/bin/poplab rollback {{ run_id.stdout }}
+        NOTE: kernel cmdline and ulimit changes require a reboot before verify passes cleanly.

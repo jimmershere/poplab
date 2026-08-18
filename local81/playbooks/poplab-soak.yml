@@ -1,0 +1,23 @@
+# Local81 playbook — sustained-load validation after a tuning change.
+name: poplab-soak
+description: 15-minute all-core soak with clock/thermal sampling; flags throttling.
+hosts:
+  - name: n155
+    address: "{{ N155_HOST }}"
+    user: "{{ N155_USER }}"
+vars:
+  duration: 900
+tasks:
+  - name: ensure stress tooling
+    package: { name: [stress-ng, lm-sensors, nvme-cli], state: present }
+    become: true
+
+  - name: soak
+    shell: "cd /opt/poplab && NO_COLOR=1 ./bin/poplab soak {{ duration }}"
+    timeout: "{{ duration + 300 }}"
+    register: soak_out
+
+  - name: archive
+    fetch:
+      src: "stdout:soak_out"
+      dest: "./reports/{{ host.name }}-soak-{{ now }}.txt"
