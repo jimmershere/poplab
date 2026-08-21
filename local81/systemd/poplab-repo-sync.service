@@ -1,0 +1,69 @@
+# poplab-repo-sync.service — nightly commit + guarded push of every fleet repo.
+#
+# THIS IS A USER UNIT, NOT A SYSTEM UNIT, AND THAT IS DELIBERATE.
+# The playbook pushes to GitHub. That needs the *user's* credentials:
+#   ~/.config/gh/hosts.yml   (gh auth token)  and/or
+#   ~/.ssh/id_ed25519        (+ the ssh-agent socket at $SSH_AUTH_SOCK)
+# A system unit runs as root, with root's $HOME, root's gh config and no agent
+# socket, so every push would fail authentication. Do not "fix" this by moving
+# the unit to /etc/systemd/system — it will cost you an hour and then not work.
+#
+# Corollary: a user unit only runs while that user has a session, unless
+# lingering is enabled. See install.sh and the README's Publishing section.
+#
+# Install:  ./install.sh --apply     (writes to ~/.config/systemd/user/)
+# Logs:     journalctl --user -u poplab-repo-sync.service -n 200
+
+[Unit]
+Description=poplab nightly fleet repo sync (commit + guarded push)
+Documentation=file:///app/poplab/local81/README.md
+Documentation=file:///app/poplab/local81/repo-guard.sh
+
+# No After=network-online.target here: that is a *system* target and a user
+# manager cannot order against it. The timer fires late at night on a machine
+# that is already up; if the network is genuinely down the playbook fails, the
+# unit exits non-zero, and Persistent=true does NOT retry — the next nightly
+# run picks it up. That is the intended behaviour: no retry storms at 3am.
+
+# Do not fail noisily on a machine where the repo is not checked out (e.g. the
+# unit was copied to a second box). Missing path => the unit is simply skipped.
+ConditionPathIsDirectory=/app/poplab
+ConditionPathExists=/app/poplab/local81/playbooks/repo-sync.yml
+
+[Service]
+Type=oneshot
+WorkingDirectory=/app/poplab
+SyslogIdentifier=poplab-repo-sync
+
+# Defaults first, override file last — systemd applies these in file order and
+# a later assignment wins, so ~/.config/poplab/repo-sync.env can change the
+# target without editing (or re-installing) this unit.
+# %u expands to the user running the user manager, which is the right default
+# only when the account name is the same on both machines. Override it if the
+# fleet user on quasimodo differs.
+Environment=QUASI_HOST=quasimodo.local
+Environment=QUASI_USER=%u
+EnvironmentFile=-%h/.config/poplab/repo-sync.env
+
+# --apply    : local81 opens no socket without it (CLAUDE.md rule 1).
+# --yes      : a timer has no tty, so an interactive `pause:` gate would hang
+#              until TimeoutStartSec kills it. The gate that actually protects
+#              a public push is repo-guard.sh inside the playbook — a non-zero
+#              exit code, which --yes cannot answer away.
+ExecStart=/app/poplab/bin/local81 run /app/poplab/local81/playbooks/repo-sync.yml \
+    --var QUASI_HOST=${QUASI_HOST} \
+    --var QUASI_USER=${QUASI_USER} \
+    --apply --yes
+
+# A wedged ssh must not sit there until the next nightly run.
+TimeoutStartSec=30min
+
+# Nightly housekeeping should never win a scheduling fight with anything the
+# user is doing if they happen to still be awake.
+Nice=10
+IOSchedulingClass=idle
+
+# No [Install] section on purpose. This service is started by its .timer, never
+# by a target. Giving it WantedBy=default.target would make it run at every
+# login as well as nightly. To fire it by hand:
+#     systemctl --user start poplab-repo-sync.service

@@ -1,0 +1,68 @@
+# Local81 playbook — read-only observation of the second highway.
+# Local81 is agentless (SSH + rsync); quasimodo needs nothing installed for this.
+#
+# The controller (pop-os) is not a Local81 host: it has no sshd listening, so it
+# audits itself directly with `./bin/poplab audit`. This playbook covers the
+# remote half of the fleet only. See local81/README.md.
+name: fleet-audit
+description: Read-only inventory + poplab audit of quasimodo. Safe to run on a schedule.
+hosts:
+  - name: quasimodo
+    address: "{{ QUASI_HOST }}"
+    user: "{{ QUASI_USER }}"
+vars:
+  repo_src: "./"
+  repo_dst: "/opt/poplab"
+tasks:
+  - name: identify the host
+    shell: |
+      printf 'hostname: %s\n' "$(hostname)"
+      printf 'kernel:   %s\n' "$(uname -sr)"
+      printf 'distro:   %s\n' "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo unknown)"
+      printf 'arch:     %s\n' "$(uname -m)"
+      printf 'cpu:      %s\n' "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+      printf 'cores:    %s\n' "$(nproc)"
+      printf 'memory:   %s\n' "$(free -h | awk '/^Mem:/{print $2}')"
+      printf 'disk /:   %s\n' "$(df -h / | awk 'NR==2{print $4" free of "$2}')"
+    register: ident
+
+  - name: check the agentic toolchain
+    shell: |
+      for t in git rsync python3 node npm gh jq curl shellcheck docker; do
+        printf '%-11s %s\n' "$t" "$(command -v $t 2>/dev/null || echo MISSING)"
+      done
+    register: toolchain
+    ignore_errors: true
+
+  - name: check the /app workspace
+    shell: "ls -la /app 2>/dev/null || echo '/app does not exist'"
+    register: workspace
+    ignore_errors: true
+
+  - name: sync poplab to the target
+    sync:
+      src: "{{ repo_src }}"
+      dest: "{{ repo_dst }}"
+      exclude: [".git", "docs/research", "*.log", "reports"]
+      delete: true
+
+  - name: run the poplab audit
+    shell: "cd {{ repo_dst }} && NO_COLOR=1 ./bin/poplab audit"
+    register: audit_out
+    ignore_errors: true
+
+  - name: persist the report on the controller
+    fetch:
+      src: "stdout:audit_out"
+      dest: "./reports/{{ host.name }}-audit-{{ now }}.txt"
+
+  - name: report
+    debug:
+      msg: |
+        host:      {{ host.name }} ({{ host.address }}) as {{ host.user }}
+        identity:
+        {{ ident.stdout }}
+        toolchain:
+        {{ toolchain.stdout }}
+        workspace: {{ workspace.stdout }}
+        audit rc:  {{ audit_out.rc }}

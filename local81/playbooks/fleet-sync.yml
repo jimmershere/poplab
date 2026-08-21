@@ -1,0 +1,72 @@
+# Local81 playbook — push the /app workspace from the controller to quasimodo.
+#
+# ############################  DIRECTION OF TRUTH  ###########################
+# This playbook pushes pop-os -> quasimodo with `delete: true`. rsync --delete
+# makes the destination match the source, which means an empty or stale source
+# directory DELETES the destination.
+#
+# Only two paths are safe to push, because pop-os holds their master copy:
+#     /app/poplab        (also in git)
+#     /app/docs          (workspace docs; pushed WITHOUT delete anyway)
+#
+# These live on QUASIMODO and exist nowhere else. Adding any of them below
+# would destroy the only copy:
+#     /app/portwright-studio    Outlaw Country Rap studio
+#     /app/AU2                  Appearance Unlimited draft site
+#     /app/fantasys             Fantasys site
+# Use fleet-pull.yml for those — it is rsync WITHOUT --delete, by construction.
+#
+# Rule: never rsync --delete toward the host holding the only copy.
+# #############################################################################
+name: fleet-sync
+description: Mirror /app/poplab and /app/portwright from pop-os to quasimodo.
+hosts:
+  - name: quasimodo
+    address: "{{ QUASI_HOST }}"
+    user: "{{ QUASI_USER }}"
+vars:
+  workspace: "/app"
+tasks:
+  - name: refuse to run if a push-unsafe path somehow entered this playbook
+    shell: |
+      for d in /app/portwright-studio /app/AU2 /app/fantasys; do
+        [ -d "$d" ] && printf 'present-on-target %s\n' "$d"
+      done
+      echo "guard-ok"
+    register: guard
+
+  - name: ensure the workspace exists and is owned by the fleet user
+    shell: "mkdir -p {{ workspace }} && chown {{ host.user }}:{{ host.user }} {{ workspace }} && echo ok"
+    become: true
+    register: ws
+
+  - name: mirror poplab
+    sync:
+      src: "/app/poplab/"
+      dest: "{{ workspace }}/poplab"
+      exclude: [".git", "*.log", "reports", "__pycache__"]
+      delete: true
+
+  # Workspace docs only, and deliberately WITHOUT delete: /app on quasimodo holds
+  # venture work that exists nowhere else, so nothing pointed at /app may ever
+  # make the destination match the source.
+  - name: push the workspace docs (no delete — /app is not ours to prune)
+    sync:
+      src: "/app/docs/"
+      dest: "{{ workspace }}/docs"
+      exclude: [".git"]
+      delete: false
+
+  - name: confirm what landed
+    shell: "find {{ workspace }} -maxdepth 2 -type d -not -path '*/.git*' | sort"
+    register: landed
+
+  - name: report
+    debug:
+      msg: |
+        workspace: {{ host.name }}:{{ workspace }}
+        {{ landed.stdout }}
+        quasimodo-owned dirs seen (NOT touched by this playbook):
+        {{ guard.stdout }}
+        NOTE: .env files and .git are deliberately NOT synced. Secrets stay on the
+        machine that owns them; git history comes from the remote, not from rsync.

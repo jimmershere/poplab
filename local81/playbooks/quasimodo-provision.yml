@@ -1,0 +1,84 @@
+# Local81 playbook — bring quasimodo up to parity as a second agentic dev node.
+#
+# UNVERIFIED AT AUTHORING TIME: quasimodo's distribution was not known when this
+# playbook was written, so it DETECTS the package manager at runtime rather than
+# asserting apt. Per poplab CLAUDE.md rule 5, nothing here is assumed.
+name: quasimodo-provision
+description: Install the agentic dev toolchain on quasimodo. Plan first, then apply.
+hosts:
+  - name: quasimodo
+    address: "{{ QUASI_HOST }}"
+    user: "{{ QUASI_USER }}"
+vars:
+  packages: "git rsync curl jq python3 python3-venv python3-pip build-essential shellcheck"
+  auto_approve: false
+tasks:
+  - name: detect the package manager
+    shell: |
+      for pm in apt-get dnf pacman zypper; do
+        if command -v $pm >/dev/null 2>&1; then echo "$pm"; exit 0; fi
+      done
+      echo "UNKNOWN"; exit 1
+    register: pm
+
+  - name: show what is already present
+    shell: |
+      for t in git rsync curl jq python3 node npm gh shellcheck; do
+        printf '%-11s %s\n' "$t" "$(command -v $t 2>/dev/null || echo MISSING)"
+      done
+    register: before
+
+  - name: gate on human review
+    pause:
+      prompt: "About to install [{{ packages }}] on {{ host.name }} via {{ pm.stdout }}. Continue?"
+      when: "{{ not auto_approve | default(false) }}"
+
+  - name: install the base toolchain
+    shell: |
+      case "{{ pm.stdout }}" in
+        apt-get) sudo -n apt-get update -qq && sudo -n DEBIAN_FRONTEND=noninteractive apt-get install -y -qq {{ packages }} ;;
+        dnf)     sudo -n dnf install -y -q {{ packages }} ;;
+        pacman)  sudo -n pacman -Sy --noconfirm {{ packages }} ;;
+        zypper)  sudo -n zypper -n install {{ packages }} ;;
+        *)       echo "unsupported package manager: {{ pm.stdout }}" >&2; exit 1 ;;
+      esac
+    register: install_out
+
+  # Node is DETECTED, never installed. Installing it the usual way means piping a
+  # remote script into a shell on the target, which is unreviewed remote code
+  # execution — not something a playbook should do on your behalf. poplab's house
+  # rule applies: tell the human exactly what to change and leave the decision
+  # with them.
+  - name: report the Node.js situation (detect only — never installs)
+    shell: |
+      if command -v node >/dev/null 2>&1; then
+        echo "present: $(node -v)"
+      else
+        echo "ABSENT — install it yourself on quasimodo if a venture needs it:"
+        echo "  https://github.com/nvm-sh/nvm#install--update-script  (read the script first)"
+        echo "  or: sudo apt install nodejs npm   (distro build, lags upstream)"
+      fi
+    register: node_out
+    ignore_errors: true
+
+  - name: verify
+    shell: |
+      for t in git rsync curl jq python3 shellcheck; do
+        command -v $t >/dev/null 2>&1 || { echo "STILL MISSING: $t"; exit 1; }
+      done
+      echo "base toolchain present"
+    register: verify_out
+    ignore_errors: true
+
+  - name: report
+    debug:
+      msg: |
+        host:        {{ host.name }}
+        pkg manager: {{ pm.stdout }}
+        before:
+        {{ before.stdout }}
+        node:        {{ node_out.stdout }}
+        verify rc:   {{ verify_out.rc }} — {{ verify_out.stdout }}
+        NOTE: the `gh` CLI and Claude Code are deliberately NOT installed here.
+        Both carry credentials and should be authenticated interactively by a human
+        on quasimodo itself, not pushed from the controller.
