@@ -1,0 +1,47 @@
+# poplab-repo-sync.timer — fires poplab-repo-sync.service once a night.
+#
+# User timer, for the same reason the service is a user unit: it must run as the
+# account that owns the gh token and the SSH key. See poplab-repo-sync.service.
+#
+# Inspect:  systemctl --user list-timers poplab-repo-sync.timer
+#           systemctl --user status poplab-repo-sync.timer
+
+[Unit]
+Description=Nightly poplab fleet repo sync
+Documentation=file:///app/poplab/local81/README.md
+
+[Timer]
+# 02:30 local time, nightly.
+#   * late enough that the day's work is committed — the playbook pushes what
+#     is in the working tree, so running it mid-session would publish a
+#     half-finished state;
+#   * early enough that the push is done before the next morning's session
+#     starts, so a session never opens against a stale origin;
+#   * off the hour and off midnight, which is where cron.daily, logrotate and
+#     man-db pile up on a Pop!_OS box.
+OnCalendar=*-*-* 02:30:00
+
+# The laptop roams and sleeps. Persistent=true records the last run in
+# ~/.local/share/systemd/timers/ and fires the moment the user manager comes
+# back if the window was missed while suspended, closed or away. Without it, a
+# machine that is never awake at 02:30 simply never syncs.
+Persistent=true
+
+# The timer does NOT wake the machine (WakeSystem defaults to false, and is
+# only honoured for system timers anyway). Persistent=true is what covers a
+# missed window, not a wakeup.
+
+# Spread the actual start over a half-hour window: keeps two fleet members from
+# hitting GitHub, and the local disk, at the same instant, and keeps a
+# catch-up run from starting the moment the lid opens.
+RandomizedDelaySec=30min
+
+# Nothing here is time-critical; let systemd batch the wakeup with others.
+AccuracySec=1min
+
+# Explicit rather than relying on the filename match, so a rename cannot
+# silently point the timer at nothing.
+Unit=poplab-repo-sync.service
+
+[Install]
+WantedBy=timers.target

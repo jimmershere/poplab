@@ -1,0 +1,7 @@
+
+# local81 runner (python)
+__pycache__/
+*.pyc
+
+# local81 fetched reports
+reports/

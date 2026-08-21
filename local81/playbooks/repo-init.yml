@@ -1,0 +1,133 @@
+# Local81 playbook — create the GitHub repos for the quasimodo-resident codebases.
+#
+# ONE-TIME. After this, repo-sync.yml keeps them current.
+#
+# Publishing is not reversible. A public repo is forked, cached and scraped within
+# minutes; deleting it later does not retract what was taken. So every push here is
+# gated by local81/repo-guard.sh, and the guard runs in the SAME shell command as
+# the push — not as an earlier task whose result could go stale between the check
+# and the act.
+#
+# Guard exit codes:  0 clean · 1 BLOCK (credentials) · 2 REVIEW (personal data/media)
+# BLOCK is never overridable. REVIEW requires accept_review=true, set deliberately
+# by a human who has read the findings.
+name: repo-init
+description: Create and populate GitHub repos for portwright-studio, AU2 and fantasys, behind the publish gate.
+hosts:
+  - name: quasimodo
+    address: "{{ QUASI_HOST }}"
+    user: "{{ QUASI_USER }}"
+vars:
+  owner: "jimmershere"
+  visibility: "public"
+  repos: "portwright-studio AU2 fantasys"
+  accept_review: false
+  auto_approve: false
+tasks:
+  - name: ship repo-guard.sh to the target
+    sync:
+      src: "/app/poplab/"
+      dest: "/app/poplab"
+      exclude: [".git", "docs/research", "*.log", "reports", "__pycache__"]
+      delete: false
+
+  - name: confirm gh is authenticated on quasimodo
+    shell: |
+      command -v gh >/dev/null 2>&1 || { echo "gh is not installed on this host"; exit 1; }
+      gh auth status 2>&1 | sed -n '1,6p'
+      gh api user --jq .login
+    register: ghauth
+
+  - name: inventory what would be published
+    shell: |
+      for r in {{ repos }}; do
+        d="/app/$r"
+        printf '\n=== %s ===\n' "$d"
+        if [ ! -d "$d" ]; then echo "ABSENT"; continue; fi
+        printf 'files: %s   size: %s\n' \
+          "$(find "$d" -type f -not -path '*/.git/*' | wc -l)" \
+          "$(du -sh "$d" 2>/dev/null | cut -f1)"
+        printf 'git:   %s\n' "$([ -d "$d/.git" ] && echo 'already a repo' || echo 'not a repo yet')"
+        find "$d" -maxdepth 1 -mindepth 1 -not -name .git -printf '  %f\n' | sort | head -20
+      done
+    register: inventory
+
+  - name: run the publish gate on each codebase
+    shell: |
+      rc_all=0
+      for r in {{ repos }}; do
+        d="/app/$r"
+        [ -d "$d" ] || continue
+        printf '\n######## %s ########\n' "$r"
+        NO_COLOR=1 /app/poplab/local81/repo-guard.sh "$d" --{{ visibility }} || rc_all=$?
+      done
+      printf '\nworst guard exit: %s\n' "$rc_all"
+      exit 0
+    register: guard
+
+  - name: show the inventory and the gate result
+    debug:
+      msg: |
+        {{ inventory.stdout }}
+        {{ guard.stdout }}
+
+  - name: human gate
+    pause:
+      prompt: "Create {{ visibility }} repos under github.com/{{ owner }} for [{{ repos }}] and push the contents shown above? This cannot be undone."
+      when: "{{ not auto_approve | default(false) }}"
+
+  # The guard is re-run here, inside the same command as `gh repo create --push`,
+  # so nothing can change between the check and the publish.
+  - name: create and push, gate re-checked immediately before each push
+    shell: |
+      set -u
+      created=""; skipped=""; blocked=""
+      for r in {{ repos }}; do
+        d="/app/$r"
+        if [ ! -d "$d" ]; then skipped="$skipped $r(absent)"; continue; fi
+
+        NO_COLOR=1 /app/poplab/local81/repo-guard.sh "$d" --{{ visibility }} >/dev/null 2>&1
+        g=$?
+        if [ "$g" -eq 1 ]; then
+          blocked="$blocked $r(credentials)"; continue
+        fi
+        if [ "$g" -eq 2 ] && [ "{{ accept_review | default(false) }}" != "True" ] \
+                          && [ "{{ accept_review | default(false) }}" != "true" ]; then
+          blocked="$blocked $r(needs-review)"; continue
+        fi
+
+        cd "$d" || { skipped="$skipped $r(cd-failed)"; continue; }
+
+        if [ ! -f .gitignore ]; then
+          printf '%s\n' '.env' '.env.*' '*.pem' '*.key' 'credentials*.json' \
+            'service-account*.json' 'node_modules/' '.venv/' '__pycache__/' \
+            '*.pyc' 'dist/' 'build/' '.DS_Store' > .gitignore
+        fi
+
+        [ -d .git ] || git init -q -b main
+        git add -A
+        git diff --cached --quiet || git -c user.name="jimmer" -c user.email="jimmershere@gmail.com" \
+          commit -q -m "Initial import of $r"
+
+        if gh repo view "{{ owner }}/$r" >/dev/null 2>&1; then
+          git remote get-url origin >/dev/null 2>&1 || git remote add origin "https://github.com/{{ owner }}/$r.git"
+          git push -u origin main -q && created="$created $r(existing-repo)"
+        else
+          gh repo create "{{ owner }}/$r" --{{ visibility }} --source=. --remote=origin --push \
+            && created="$created $r" || skipped="$skipped $r(create-failed)"
+        fi
+        cd /
+      done
+      printf 'created:%s\n' "${created:- none}"
+      printf 'blocked:%s\n' "${blocked:- none}"
+      printf 'skipped:%s\n' "${skipped:- none}"
+    register: result
+
+  - name: report
+    debug:
+      msg: |
+        {{ result.stdout }}
+        Anything under "blocked" was NOT published. Read the gate output above,
+        remove or gitignore what it found, and re-run. If a credential was already
+        committed in history, rotate it — deleting the file does not unpublish it.
+        Next: install the nightly job — local81/systemd/install.sh --apply

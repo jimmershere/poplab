@@ -1,0 +1,88 @@
+# Local81 playbook — commit and push every quasimodo-resident fleet repo to origin.
+#
+# This is what the nightly timer runs (local81/systemd/). It is unattended, which
+# is exactly why the publish gate matters: a secret committed at 2pm would other-
+# wise be published at 3am with nobody watching. repo-guard.sh runs in the same
+# shell command as the push, and a repo that fails the gate is SKIPPED, not pushed.
+#
+# The playbook exits non-zero when anything was skipped, so a failed nightly run
+# shows up in `systemctl --user status poplab-repo-sync.service` instead of
+# passing silently.
+#
+# poplab itself is not here: its master copy is on the controller (pop-os), which
+# runs no sshd. It is pushed from there — see local81/README.md, Publishing.
+name: repo-sync
+description: Nightly. Commit and push the quasimodo fleet repos, each gated by repo-guard.
+hosts:
+  - name: quasimodo
+    address: "{{ QUASI_HOST }}"
+    user: "{{ QUASI_USER }}"
+vars:
+  repos: "portwright-studio AU2 fantasys"
+  visibility: "public"
+  accept_review: false
+tasks:
+  - name: refresh repo-guard on the target
+    sync:
+      src: "/app/poplab/"
+      dest: "/app/poplab"
+      exclude: [".git", "docs/research", "*.log", "reports", "__pycache__"]
+      delete: false
+
+  - name: commit and push each repo, gate re-checked immediately before each push
+    shell: |
+      set -u
+      pushed=""; clean=""; skipped=""; rc=0
+      for r in {{ repos }}; do
+        d="/app/$r"
+        [ -d "$d/.git" ] || { skipped="$skipped $r(not-a-repo)"; rc=1; continue; }
+        cd "$d" || { skipped="$skipped $r(cd-failed)"; rc=1; continue; }
+
+        # Nothing to do? Say so and move on without touching the remote.
+        if git diff --quiet && git diff --cached --quiet && [ -z "$(git status --porcelain)" ]; then
+          if [ -z "$(git log origin/main..HEAD 2>/dev/null)" ]; then
+            clean="$clean $r"; cd /; continue
+          fi
+        fi
+
+        NO_COLOR=1 /app/poplab/local81/repo-guard.sh "$d" --{{ visibility }} >/tmp/guard-$r.txt 2>&1
+        g=$?
+        if [ "$g" -eq 1 ]; then
+          skipped="$skipped $r(BLOCKED-credentials)"; rc=1; cd /; continue
+        fi
+        if [ "$g" -eq 2 ] && [ "{{ accept_review | default(false) }}" != "True" ] \
+                          && [ "{{ accept_review | default(false) }}" != "true" ]; then
+          skipped="$skipped $r(needs-review)"; rc=1; cd /; continue
+        fi
+
+        git add -A
+        git diff --cached --quiet || git -c user.name="jimmer" -c user.email="jimmershere@gmail.com" \
+          commit -q -m "Nightly sync from quasimodo"
+        if git push -q origin HEAD 2>/dev/null; then
+          pushed="$pushed $r"
+        else
+          skipped="$skipped $r(push-failed)"; rc=1
+        fi
+        cd /
+      done
+      printf 'pushed:  %s\n' "${pushed:- none}"
+      printf 'clean:   %s\n' "${clean:- none}"
+      printf 'skipped: %s\n' "${skipped:- none}"
+      for r in {{ repos }}; do
+        [ -f "/tmp/guard-$r.txt" ] || continue
+        case "$skipped" in *"$r("*) printf '\n--- why %s was skipped ---\n' "$r"; cat "/tmp/guard-$r.txt";; esac
+      done
+      exit "$rc"
+    register: result
+    ignore_errors: true
+
+  - name: report
+    debug:
+      msg: |
+        {{ result.stdout }}
+        exit: {{ result.rc }}
+        A non-zero exit means at least one repo was NOT pushed. Nothing was published
+        that failed the gate.
+
+  - name: fail the run if anything was skipped
+    shell: "exit {{ result.rc }}"
