@@ -49,6 +49,16 @@ The OODA loop this repo runs on:
 
 ## Publishing
 
+`repo-guard.sh` scans three things before any push: the working tree, **the outgoing
+commit range**, and the media/personal-data surface. The commit-range scan is the one
+that is easy to leave out and expensive to miss — a credential committed at 2pm and
+deleted at 4pm leaves a spotless working tree, and `git push` ships both commits.
+The guard resolves the range as `@{u}..HEAD`, or the entire history when the branch
+has no upstream yet, and blocks on any credential-shaped line those commits *add*.
+Deleting the file afterwards does not help: the blob stays reachable, so the fix is
+to rewrite the range and rotate the secret.
+
+
 `repo-guard.sh` is the gate in front of every `git push` the fleet performs.
 `repo-init.yml` and `repo-sync.yml` both run it, and both refuse to push on a
 non-zero verdict.

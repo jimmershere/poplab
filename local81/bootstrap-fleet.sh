@@ -198,12 +198,30 @@ if (( DO_SUDOERS )); then
     # visudo -cf validates BEFORE the file lands in /etc/sudoers.d, so a typo
     # can never lock the account out of sudo.
     if (( password_available )); then
-      printf '%s\n' "$SUDOERS_BODY" | SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force \
-        ssh -o StrictHostKeyChecking=yes -o CheckHostIP=no -o NumberOfPasswordPrompts=1 \
-            -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-            "$FLEET_USER@$QHOST" \
-        "cat > /tmp/.poplab-sudoers && sudo -S -p '' visudo -cf /tmp/.poplab-sudoers >/dev/null && sudo -S -p '' install -o root -g root -m 0440 /tmp/.poplab-sudoers $SUDOERS_FILE; rc=\$?; rm -f /tmp/.poplab-sudoers; exit \$rc" \
-        && ok "installed $SUDOERS_FILE on $QNAME" || fail "could not install sudoers on $QNAME (see note below)"
+      # SSH_ASKPASS authenticates the ssh *client*; it gives remote sudo nothing.
+      # And a single stdin stream does not work either — the remote `cat` drains
+      # it to EOF before `sudo -S` ever reads. So: step 3 has already installed
+      # the key, so connect with the key, and send the password as the FIRST LINE
+      # of stdin for the remote to consume with `read` before `cat` takes the rest.
+      REMOTE_SUDOERS_INSTALL="
+        IFS= read -r PW
+        umask 077; cat > /tmp/.poplab-sudoers
+        printf '%s\n' \"\$PW\" | sudo -S -p '' visudo -cf /tmp/.poplab-sudoers >/dev/null 2>&1 || { rm -f /tmp/.poplab-sudoers; echo VISUDO_REJECTED >&2; exit 3; }
+        printf '%s\n' \"\$PW\" | sudo -S -p '' install -o root -g root -m 0440 /tmp/.poplab-sudoers $SUDOERS_FILE
+        rc=\$?; unset PW; rm -f /tmp/.poplab-sudoers; exit \$rc"
+      if { tr -d '\r\n' < "$ENV_FILE"; printf '\n%s\n' "$SUDOERS_BODY"; } \
+           | ssh "${SSH_OPTS[@]}" -i "$KEY" "$FLEET_USER@$QHOST" "$REMOTE_SUDOERS_INSTALL" 2>/dev/null; then
+        ok "installed $SUDOERS_FILE on $QNAME"
+      else
+        rc=$?
+        if (( rc == 3 )); then
+          fail "visudo rejected the drop-in on $QNAME — nothing was installed"
+        else
+          fail "could not install sudoers on $QNAME (wrong password in $ENV_FILE, or $FLEET_USER is not a sudoer)"
+        fi
+        warn "run this on $QNAME yourself instead:"
+        printf '%s\n' "      echo '$SUDOERS_LINE' | sudo tee $SUDOERS_FILE && sudo chmod 0440 $SUDOERS_FILE"
+      fi
     else
       warn "no credential available; run this on $QNAME yourself:"
       printf '%s\n' "      echo '$SUDOERS_LINE' | sudo tee $SUDOERS_FILE && sudo chmod 0440 $SUDOERS_FILE"

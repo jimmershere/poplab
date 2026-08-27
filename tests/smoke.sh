@@ -113,6 +113,8 @@ for p in local81/playbooks/*.yml; do
   t "local81 lint $(basename "$p")" env NO_COLOR=1 ./bin/local81 lint "$p"
 done
 t "local81 smoke suite"        bash tests/local81-smoke.sh
+t "repo-guard is executable"   test -x local81/repo-guard.sh
+t "repo-guard smoke suite"     bash tests/repo-guard-smoke.sh
 
 echo "docs"
 for d in README.md CLAUDE.md docs/research/01-pop-os-24.04.md docs/research/02-ryzen-6800h-radeon-680m.md docs/research/03-memory-io-dev.md local81/README.md; do

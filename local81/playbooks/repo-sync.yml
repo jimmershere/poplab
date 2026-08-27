@@ -5,6 +5,10 @@
 # wise be published at 3am with nobody watching. repo-guard.sh runs in the same
 # shell command as the push, and a repo that fails the gate is SKIPPED, not pushed.
 #
+# The gate scans the OUTGOING COMMIT RANGE, not just the working tree — a secret
+# committed and then deleted leaves a clean tree but is still shipped by the push.
+
+#
 # The playbook exits non-zero when anything was skipped, so a failed nightly run
 # shows up in `systemctl --user status poplab-repo-sync.service` instead of
 # passing silently.
