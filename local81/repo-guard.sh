@@ -52,6 +52,9 @@ IGNORE_FILE="$DIR/.repo-guard-ignore"
 excluded() {
   local f; f="$(realpath -- "$1" 2>/dev/null || echo "$1")"
   [[ "$f" == "$SELF" ]] && return 0
+  # The exclusion list is configuration for this scanner, not shippable content,
+  # and naming what it excludes tends to mean naming credential shapes.
+  [[ "$f" == "$(realpath -- "$IGNORE_FILE" 2>/dev/null || echo "$IGNORE_FILE")" ]] && return 0
   [[ -f "$IGNORE_FILE" ]] || return 1
   local pat
   while IFS= read -r pat; do
