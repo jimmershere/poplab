@@ -1,0 +1,14 @@
+# repo-guard exclusions for poplab.
+# Only for files that necessarily CONTAIN credential shapes in order to do their
+# job. Never add a file here to silence a finding you have not understood.
+
+# Prints an example sudoers line in an error hint. Not a secret.
+bin/local81
+
+# The gate's own regression fixtures. They hold deliberately fake key headers and
+# token shapes so the suite can prove the guard BLOCKS on them; excluding this
+# file is what makes the suite possible. The values in it are not real.
+tests/repo-guard-smoke.sh
+
+# Documentation that describes the patterns the guard looks for.
+local81/README.md

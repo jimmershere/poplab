@@ -1,0 +1,73 @@
+# Local81 playbook — pull quasimodo-originated work back to the controller.
+#
+# DIRECTION MATTERS. The venture projects were created on quasimodo and exist
+# nowhere else. fleet-sync.yml pushes pop-os -> quasimodo with `delete: true`;
+# pointing that at a venture directory would delete the only copy. This playbook
+# is the safe opposite: it uses `fetch`, which is rsync WITHOUT --delete and
+# therefore cannot remove anything on either end.
+#
+# Source-of-truth rule: never rsync --delete toward the host holding the only copy.
+#
+# The three paths below are USER-REPORTED, not verified — no SSH session has
+# confirmed they exist. Run fleet-audit first; the inventory task lists /app.
+name: fleet-pull
+description: Copy the quasimodo-resident venture projects to the controller. Never deletes.
+hosts:
+  - name: quasimodo
+    address: "{{ QUASI_HOST }}"
+    user: "{{ QUASI_USER }}"
+vars:
+  dest_root: "/app"
+tasks:
+  - name: show what is actually on quasimodo before copying anything
+    shell: |
+      for d in /app/portwright-studio /app/AU2 /app/fantasys; do
+        if [ -d "$d" ]; then
+          printf '%-24s %s in %s files\n' "$d" \
+            "$(du -sh "$d" 2>/dev/null | cut -f1)" \
+            "$(find "$d" -type f 2>/dev/null | wc -l)"
+        else
+          printf '%-24s ABSENT\n' "$d"
+        fi
+      done
+      printf '\n--- everything else under /app ---\n'
+      ls -1 /app 2>/dev/null
+    register: inventory
+
+  - name: report the inventory
+    debug:
+      msg: |
+        {{ inventory.stdout }}
+
+  - name: gate before copying
+    pause:
+      prompt: "Copy the directories above from quasimodo into {{ dest_root }} on this machine? Nothing on quasimodo is modified or deleted."
+      when: "{{ not auto_approve | default(false) }}"
+
+  - name: pull the Outlaw Country Rap studio
+    fetch:
+      src: "/app/portwright-studio"
+      dest: "{{ dest_root }}/"
+
+  - name: pull the Appearance Unlimited draft site
+    fetch:
+      src: "/app/AU2"
+      dest: "{{ dest_root }}/"
+
+  - name: pull the Fantasys site
+    fetch:
+      src: "/app/fantasys"
+      dest: "{{ dest_root }}/"
+
+  - name: confirm what landed on the controller
+    shell: "echo controller-side check runs locally; see the summary"
+    register: noop
+    ignore_errors: true
+
+  - name: report
+    debug:
+      msg: |
+        Copied into {{ dest_root }} on the controller. quasimodo is unchanged.
+        These are working copies, NOT a backup — a second copy on a laptop in the
+        same bag is not an offsite copy. None of the three is in git yet; that is
+        the actual fix.

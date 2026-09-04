@@ -1,0 +1,1195 @@
+#!/usr/bin/env python3
+# local81 — agentless (SSH + rsync) playbook runner for the poplab harness.
+#
+#   local81 run <playbook.yml>   execute a playbook (DRY RUN unless --apply)
+#   local81 lint <playbook.yml>  validate structure, dialect and every {{ expr }}
+#   local81 hosts <playbook.yml> list the hosts a playbook targets
+#
+# Flags for `run`:
+#   --host NAME       limit the run to one host from the playbook
+#   --var K=V         set/override a variable (repeatable)
+#   --apply           actually contact the targets and execute (default: dry run)
+#   --check           explicit dry run — the default, accepted for symmetry
+#   --yes             never prompt (auto-answers `pause`)
+#   --quiet
+#
+# Contract, mirroring bin/poplab and CLAUDE.md rule 1:
+#   * DRY RUN IS THE DEFAULT. Without --apply nothing is executed and no socket
+#     is opened — local81 only prints the exact argv of every command.
+#   * Agentless. Nothing is ever installed on the target to support local81
+#     itself; SSH, rsync and a POSIX shell are the whole runtime requirement.
+#   * `become: true` means `sudo -n` (non-interactive). Never a password prompt.
+#
+# Environment:
+#   L81_SSH_KEY   path to a private key, passed to ssh/rsync as -i
+#   L81_SSH_INSECURE=1  relax host-key checking to accept-new (new-host enrolment only)
+#   NO_COLOR      set to disable colour, as in lib/common.sh
+"""Agentless playbook runner. See the usage block above (it *is* --help)."""
+
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - environment problem, not a code path
+    sys.stderr.write("local81: PyYAML is required (apt install python3-yaml)\n")
+    raise SystemExit(70)
+
+LOCAL81_VERSION = "1.0.0"
+_USAGE_RANGE = (2, 25)  # cf. `sed -n '2,22p' "$0"` in bin/poplab
+
+# ------------------------------------------------------------------ colours --
+if sys.stdout.isatty() and not os.environ.get("NO_COLOR", ""):
+    C_RST = "\033[0m"; C_DIM = "\033[2m"; C_BLD = "\033[1m"
+    C_RED = "\033[31m"; C_GRN = "\033[32m"; C_YEL = "\033[33m"
+    C_CYN = "\033[36m"; C_BLU = "\033[34m"
+else:
+    C_RST = C_DIM = C_BLD = C_RED = C_GRN = C_YEL = C_CYN = C_BLU = ""
+
+QUIET = False
+
+
+# ------------------------------------------------------------------ logging --
+# Glyphs and indentation deliberately identical to lib/common.sh so poplab and
+# local81 output interleaves as one product.
+def log(msg="", stream=sys.stdout):
+    if not QUIET:
+        stream.write(msg + "\n")
+        stream.flush()  # keep stdout/stderr interleaving deterministic under a pipe
+
+
+def info(msg):
+    log("%s  ·%s %s" % (C_BLU, C_RST, msg))
+
+
+def ok(msg):
+    log("%s  ✔%s %s" % (C_GRN, C_RST, msg))
+
+
+def warn(msg):
+    log("%s  ▲%s %s" % (C_YEL, C_RST, msg), sys.stderr)
+
+
+def err(msg):
+    log("%s  ✘%s %s" % (C_RED, C_RST, msg), sys.stderr)
+
+
+def skip(msg):
+    log("%s  ~ %s%s" % (C_DIM, msg, C_RST))
+
+
+def dry(msg):
+    log("%s  [dry-run]%s %s" % (C_YEL, C_RST, msg))
+
+
+def head1(msg):
+    log("")
+    log("%s%s══ %s %s" % (C_BLD, C_CYN, msg, C_RST))
+
+
+def head2(msg):
+    log("")
+    log("%s%s%s" % (C_BLD, msg, C_RST))
+
+
+def die(msg, code=1):
+    err(msg)
+    raise SystemExit(code)
+
+
+# ============================================================================
+# Expression evaluator
+# ============================================================================
+# A deliberately small, Jinja2-shaped expression language. Jinja2 is NOT a
+# dependency and eval() is never called on playbook input: expressions are
+# tokenised, parsed into a tuple AST by recursive descent, and walked.
+#
+#   expr     := ternary
+#   ternary  := or [ 'if' or 'else' ternary ]
+#   or       := and { 'or' and }
+#   and      := not { 'and' not }
+#   not      := 'not' not | cmp
+#   cmp      := add [ ('=='|'!='|'<'|'<='|'>'|'>=') add ]
+#   add      := mul { ('+'|'-') mul }
+#   mul      := unary { ('*'|'//'|'%') unary }
+#   unary    := '-' unary | postfix
+#   postfix  := primary { '.' NAME | '|' NAME [ '(' [expr {',' expr}] ')' ] }
+#   primary  := STR | NUMBER | true|false|none | NAME | '(' expr ')'
+#
+# Filters bind tighter than every operator, matching Jinja, so
+# `not auto_approve | default(false)` is `not (auto_approve | default(false))`.
+# Anything outside this grammar is a hard error at LINT time — local81 never
+# degrades an unsupported expression into an empty string.
+
+class TemplateError(Exception):
+    pass
+
+
+class _Undefined:
+    """A name that was never supplied. Falsy; explodes if rendered."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name):
+        self.name = name
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "undefined(%s)" % self.name
+
+
+_TOKEN_RE = re.compile(r"""
+    (?P<ws>\s+)
+  | (?P<str>'[^'\\]*(?:\\.[^'\\]*)*'|"[^"\\]*(?:\\.[^"\\]*)*")
+  | (?P<num>\d+\.\d+|\d+)
+  | (?P<name>[A-Za-z_][A-Za-z0-9_]*)
+  | (?P<op>==|!=|<=|>=|//|[|().,+\-*/%<>])
+""", re.VERBOSE)
+
+_KEYWORDS = {"and", "or", "not", "if", "else"}
+_CONSTANTS = {
+    "true": True, "True": True, "false": False, "False": False,
+    "none": None, "None": None, "null": None,
+}
+
+
+def _tokenize(src):
+    toks, pos = [], 0
+    while pos < len(src):
+        m = _TOKEN_RE.match(src, pos)
+        if not m:
+            raise TemplateError("unexpected character %r at offset %d" % (src[pos], pos))
+        pos = m.end()
+        kind = m.lastgroup
+        if kind == "ws":
+            continue
+        text = m.group()
+        if kind == "str":
+            toks.append(("str", text[1:-1].replace("\\'", "'").replace('\\"', '"')))
+        elif kind == "num":
+            toks.append(("num", float(text) if "." in text else int(text)))
+        elif kind == "name":
+            toks.append(("kw" if text in _KEYWORDS else "name", text))
+        else:
+            toks.append(("op", text))
+    toks.append(("end", None))
+    return toks
+
+
+class _Parser:
+    def __init__(self, src):
+        self.src = src
+        self.toks = _tokenize(src)
+        self.i = 0
+
+    def peek(self):
+        return self.toks[self.i]
+
+    def next(self):
+        t = self.toks[self.i]
+        self.i += 1
+        return t
+
+    def accept(self, kind, text=None):
+        k, v = self.peek()
+        if k == kind and (text is None or v == text):
+            self.i += 1
+            return True
+        return False
+
+    def expect(self, kind, text=None):
+        if not self.accept(kind, text):
+            k, v = self.peek()
+            raise TemplateError(
+                "expected %s in %r but found %r" % (text or kind, self.src, v if v is not None else "end of expression"))
+
+    def parse(self):
+        node = self.ternary()
+        if self.peek()[0] != "end":
+            raise TemplateError("trailing input %r in %r" % (self.peek()[1], self.src))
+        return node
+
+    def ternary(self):
+        node = self.or_()
+        if self.accept("kw", "if"):
+            test = self.or_()
+            self.expect("kw", "else")
+            return ("cond", test, node, self.ternary())
+        return node
+
+    def or_(self):
+        node = self.and_()
+        while self.accept("kw", "or"):
+            node = ("or", node, self.and_())
+        return node
+
+    def and_(self):
+        node = self.not_()
+        while self.accept("kw", "and"):
+            node = ("and", node, self.not_())
+        return node
+
+    def not_(self):
+        if self.accept("kw", "not"):
+            return ("not", self.not_())
+        return self.cmp_()
+
+    def cmp_(self):
+        node = self.add()
+        k, v = self.peek()
+        if k == "op" and v in ("==", "!=", "<", "<=", ">", ">="):
+            self.next()
+            return ("bin", v, node, self.add())
+        return node
+
+    def add(self):
+        node = self.mul()
+        while True:
+            k, v = self.peek()
+            if k == "op" and v in ("+", "-"):
+                self.next()
+                node = ("bin", v, node, self.mul())
+            else:
+                return node
+
+    def mul(self):
+        node = self.unary()
+        while True:
+            k, v = self.peek()
+            if k == "op" and v in ("*", "//", "%"):
+                self.next()
+                node = ("bin", v, node, self.unary())
+            else:
+                return node
+
+    def unary(self):
+        if self.accept("op", "-"):
+            return ("neg", self.unary())
+        return self.postfix()
+
+    def postfix(self):
+        node = self.primary()
+        while True:
+            if self.accept("op", "."):
+                k, v = self.next()
+                if k != "name":
+                    raise TemplateError("expected an attribute name after '.' in %r" % self.src)
+                node = ("attr", node, v)
+            elif self.accept("op", "|"):
+                k, v = self.next()
+                if k != "name":
+                    raise TemplateError("expected a filter name after '|' in %r" % self.src)
+                if v not in FILTERS:
+                    raise TemplateError(
+                        "unsupported filter %r in %r (supported: %s)" % (v, self.src, ", ".join(sorted(FILTERS))))
+                args = []
+                if self.accept("op", "("):
+                    if not self.accept("op", ")"):
+                        args.append(self.ternary())
+                        while self.accept("op", ","):
+                            args.append(self.ternary())
+                        self.expect("op", ")")
+                node = ("filter", v, node, args)
+            else:
+                return node
+
+    def primary(self):
+        k, v = self.next()
+        if k == "str":
+            return ("lit", v)
+        if k == "num":
+            return ("lit", v)
+        if k == "name":
+            if v in _CONSTANTS:
+                return ("lit", _CONSTANTS[v])
+            return ("name", v)
+        if k == "op" and v == "(":
+            node = self.ternary()
+            self.expect("op", ")")
+            return node
+        raise TemplateError("unexpected %r in %r" % (v if v is not None else "end of expression", self.src))
+
+
+def parse_expr(src):
+    return _Parser(src).parse()
+
+
+# -------------------------------------------------------------------- filters
+def _f_default(value, fallback="", boolean=False):
+    if isinstance(value, _Undefined):
+        return fallback
+    if boolean and not value:
+        return fallback
+    return value
+
+
+def _f_require(value, *_):
+    if isinstance(value, _Undefined):
+        raise TemplateError("variable %r is required but was never set" % value.name)
+    return value
+
+
+FILTERS = {
+    "default": _f_default,
+    "d": _f_default,
+    "bool": lambda v, *_: bool(_f_require(v)),
+    "int": lambda v, *_: int(_f_require(v)),
+    "string": lambda v, *_: stringify(_f_require(v)),
+    "lower": lambda v, *_: stringify(_f_require(v)).lower(),
+    "upper": lambda v, *_: stringify(_f_require(v)).upper(),
+    "trim": lambda v, *_: stringify(_f_require(v)).strip(),
+    "length": lambda v, *_: len(_f_require(v)),
+}
+
+
+def _defined(value, where):
+    if isinstance(value, _Undefined):
+        raise TemplateError(
+            "undefined variable %r used in %s — pass --var %s=... , add it to vars:, "
+            "or guard it with | default(...)" % (value.name, where, value.name))
+    return value
+
+
+def eval_expr(node, ctx, where="expression"):
+    kind = node[0]
+    if kind == "lit":
+        return node[1]
+    if kind == "name":
+        return ctx[node[1]] if node[1] in ctx else _Undefined(node[1])
+    if kind == "attr":
+        base = _defined(eval_expr(node[1], ctx, where), where)
+        if isinstance(base, dict):
+            if node[2] not in base:
+                raise TemplateError("%r has no attribute %r in %s" % (node[1], node[2], where))
+            return base[node[2]]
+        raise TemplateError("cannot take .%s of a non-mapping value in %s" % (node[2], where))
+    if kind == "filter":
+        return FILTERS[node[1]](eval_expr(node[2], ctx, where),
+                                *[eval_expr(a, ctx, where) for a in node[3]])
+    if kind == "not":
+        return not eval_expr(node[1], ctx, where)
+    if kind == "neg":
+        return -_defined(eval_expr(node[1], ctx, where), where)
+    if kind == "and":
+        left = eval_expr(node[1], ctx, where)
+        return eval_expr(node[2], ctx, where) if left else left
+    if kind == "or":
+        left = eval_expr(node[1], ctx, where)
+        return left if left else eval_expr(node[2], ctx, where)
+    if kind == "cond":
+        return eval_expr(node[2] if eval_expr(node[1], ctx, where) else node[3], ctx, where)
+    if kind == "bin":
+        op = node[1]
+        left = _defined(eval_expr(node[2], ctx, where), where)
+        right = _defined(eval_expr(node[3], ctx, where), where)
+        try:
+            if op == "==":
+                return left == right
+            if op == "!=":
+                return left != right
+            if op == "<":
+                return left < right
+            if op == "<=":
+                return left <= right
+            if op == ">":
+                return left > right
+            if op == ">=":
+                return left >= right
+            if op == "+":
+                return left + right
+            if op == "-":
+                return left - right
+            if op == "*":
+                return left * right
+            if op == "//":
+                return left // right
+            if op == "%":
+                return left % right
+        except TypeError as exc:
+            raise TemplateError("cannot compute %r %s %r in %s (%s)" % (left, op, right, where, exc))
+    raise TemplateError("internal: unhandled node %r" % (kind,))  # pragma: no cover
+
+
+# ------------------------------------------------------------------ rendering
+_TMPL_RE = re.compile(r"\{\{(.*?)\}\}", re.S)
+
+
+def stringify(value):
+    """Render a value the way a shell command wants to see it."""
+    if value is None:
+        return ""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+def has_template(text):
+    return isinstance(text, str) and "{{" in text
+
+
+def render(text, ctx, where="playbook"):
+    """Substitute every {{ expr }}. A string that is nothing but one
+    expression keeps its native type (so `when: "{{ flag }}"` stays a bool)."""
+    if not isinstance(text, str) or "{{" not in text:
+        return text
+    # The native-type fast path applies ONLY when the string is exactly one
+    # expression. fullmatch() alone is not enough: _TMPL_RE is non-greedy, but
+    # fullmatch forces it to span the whole string, so "{{ a }}\n{{ b }}" matched
+    # with group(1) = " a }}\n{{ b " and blew up in the expression parser. Require
+    # a single match that covers the whole stripped string.
+    stripped = text.strip()
+    found = list(_TMPL_RE.finditer(stripped))
+    if len(found) == 1 and found[0].start() == 0 and found[0].end() == len(stripped):
+        return _defined(eval_expr(parse_expr(found[0].group(1).strip()), ctx, where), where)
+
+    def sub(m):
+        return stringify(_defined(eval_expr(parse_expr(m.group(1).strip()), ctx, where), where))
+
+    return _TMPL_RE.sub(sub, text)
+
+
+def render_deep(obj, ctx, where="playbook"):
+    if isinstance(obj, str):
+        return render(obj, ctx, where)
+    if isinstance(obj, list):
+        return [render_deep(o, ctx, where) for o in obj]
+    if isinstance(obj, dict):
+        return {k: render_deep(v, ctx, where) for k, v in obj.items()}
+    return obj
+
+
+def coerce_scalar(text):
+    """--var and environment values arrive as strings. Coerce the obvious
+    literals so `--var auto_approve=false` is falsy rather than a truthy
+    non-empty string."""
+    low = text.strip().lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    if low in ("none", "null", ""):
+        return None if low != "" else ""
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+# ============================================================================
+# Playbook loading + lint
+# ============================================================================
+TASK_TYPES = ("sync", "shell", "fetch", "pause", "debug", "package")
+TASK_ATTRS = ("name", "register", "become", "ignore_errors", "when", "timeout")
+HOST_KEYS = ("name", "address", "user")
+TOP_KEYS = ("name", "description", "hosts", "vars", "tasks")
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class LintError(Exception):
+    pass
+
+
+def load_playbook(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh)
+    except FileNotFoundError:
+        raise LintError("no such playbook: %s" % path)
+    except yaml.YAMLError as exc:
+        raise LintError("YAML parse error in %s: %s" % (path, exc))
+    if not isinstance(doc, dict):
+        raise LintError("%s: top level must be a mapping" % path)
+    return doc
+
+
+def _check_templates(obj, where, problems):
+    """Parse every {{ expr }} found anywhere under obj. Parse errors are fatal;
+    unknown names are not, because they may legitimately arrive via --var/env."""
+    if isinstance(obj, str):
+        if "{%" in obj:
+            problems.append("%s: Jinja statement blocks ({%% ... %%}) are not supported; "
+                            "local81 only understands {{ expression }}" % where)
+        if obj.count("{{") != obj.count("}}"):
+            problems.append("%s: unbalanced {{ }} in %r" % (where, obj))
+        for m in _TMPL_RE.finditer(obj):
+            body = m.group(1).strip()
+            if not body:
+                problems.append("%s: empty expression '{{ }}'" % where)
+                continue
+            try:
+                parse_expr(body)
+            except TemplateError as exc:
+                problems.append("%s: %s" % (where, exc))
+    elif isinstance(obj, list):
+        for i, o in enumerate(obj):
+            _check_templates(o, "%s[%d]" % (where, i), problems)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _check_templates(v, "%s.%s" % (where, k), problems)
+
+
+def lint_playbook(doc, path):
+    """Return (problems, notes). Non-empty problems == lint failure."""
+    problems, notes = [], []
+
+    for key in doc:
+        if key not in TOP_KEYS:
+            problems.append("top level: unknown key %r (allowed: %s)" % (key, ", ".join(TOP_KEYS)))
+    if not doc.get("name"):
+        problems.append("top level: 'name' is required")
+
+    hosts = doc.get("hosts")
+    if not isinstance(hosts, list) or not hosts:
+        problems.append("hosts: must be a non-empty list")
+        hosts = []
+    for i, h in enumerate(hosts):
+        w = "hosts[%d]" % i
+        if not isinstance(h, dict):
+            problems.append("%s: must be a mapping" % w)
+            continue
+        for key in h:
+            if key not in HOST_KEYS:
+                problems.append("%s: unknown key %r (allowed: %s)" % (w, key, ", ".join(HOST_KEYS)))
+        for key in ("name", "address"):
+            if not h.get(key):
+                problems.append("%s: %r is required" % (w, key))
+
+    if "vars" in doc and not isinstance(doc["vars"], dict):
+        problems.append("vars: must be a mapping")
+
+    tasks = doc.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        problems.append("tasks: must be a non-empty list")
+        tasks = []
+    for i, t in enumerate(tasks):
+        w = "tasks[%d]" % i
+        if not isinstance(t, dict):
+            problems.append("%s: must be a mapping" % w)
+            continue
+        if t.get("name"):
+            w = "tasks[%d] (%s)" % (i, t["name"])
+        kinds = [k for k in t if k in TASK_TYPES]
+        unknown = [k for k in t if k not in TASK_TYPES and k not in TASK_ATTRS]
+        for key in unknown:
+            problems.append("%s: unknown key %r (task types: %s; attrs: %s)"
+                            % (w, key, ", ".join(TASK_TYPES), ", ".join(TASK_ATTRS)))
+        if len(kinds) != 1:
+            problems.append("%s: expected exactly one task type, found %s"
+                            % (w, ", ".join(kinds) if kinds else "none"))
+            continue
+        kind = kinds[0]
+        body = t[kind]
+        if "register" in t and not (isinstance(t["register"], str) and IDENT_RE.match(t["register"])):
+            problems.append("%s: register must be a bare identifier" % w)
+        for flag in ("become", "ignore_errors"):
+            if flag in t and not isinstance(t[flag], bool):
+                problems.append("%s: %s must be true or false" % (w, flag))
+
+        if kind == "shell":
+            if not isinstance(body, str) or not body.strip():
+                problems.append("%s: shell must be a non-empty string" % w)
+        elif kind == "sync":
+            if not isinstance(body, dict):
+                problems.append("%s: sync must be a mapping" % w)
+            else:
+                for key in body:
+                    if key not in ("src", "dest", "exclude", "delete"):
+                        problems.append("%s: sync: unknown key %r" % (w, key))
+                for key in ("src", "dest"):
+                    if not body.get(key):
+                        problems.append("%s: sync: %r is required" % (w, key))
+                if "exclude" in body and not isinstance(body["exclude"], list):
+                    problems.append("%s: sync: exclude must be a list" % w)
+                if "delete" in body and not isinstance(body["delete"], bool):
+                    problems.append("%s: sync: delete must be true or false" % w)
+        elif kind == "fetch":
+            if not isinstance(body, dict):
+                problems.append("%s: fetch must be a mapping" % w)
+            else:
+                for key in body:
+                    if key not in ("src", "dest"):
+                        problems.append("%s: fetch: unknown key %r" % (w, key))
+                for key in ("src", "dest"):
+                    if not body.get(key):
+                        problems.append("%s: fetch: %r is required" % (w, key))
+                src = body.get("src", "")
+                if isinstance(src, str) and src.startswith("stdout:"):
+                    reg = src.split(":", 1)[1]
+                    known = [x.get("register") for x in tasks if isinstance(x, dict)]
+                    if reg not in known:
+                        problems.append("%s: fetch: stdout:%s refers to a register no task defines" % (w, reg))
+        elif kind == "pause":
+            if not isinstance(body, dict):
+                problems.append("%s: pause must be a mapping" % w)
+            else:
+                for key in body:
+                    if key not in ("prompt", "when"):
+                        problems.append("%s: pause: unknown key %r" % (w, key))
+        elif kind == "debug":
+            if isinstance(body, dict):
+                for key in body:
+                    if key != "msg":
+                        problems.append("%s: debug: unknown key %r" % (w, key))
+                if not body.get("msg"):
+                    problems.append("%s: debug: 'msg' is required" % w)
+            elif not isinstance(body, str):
+                problems.append("%s: debug must be a mapping with 'msg', or a string" % w)
+        elif kind == "package":
+            if not isinstance(body, dict):
+                problems.append("%s: package must be a mapping" % w)
+            else:
+                for key in body:
+                    if key not in ("name", "state"):
+                        problems.append("%s: package: unknown key %r" % (w, key))
+                if not body.get("name"):
+                    problems.append("%s: package: 'name' is required" % w)
+                state = body.get("state", "present")
+                if state != "present":
+                    problems.append("%s: package: only state 'present' is supported "
+                                    "(removal is not reversible; do it by hand)" % w)
+                notes.append("%s: installs packages on the target with apt-get; needs --apply and passwordless sudo" % w)
+
+    _check_templates(doc, os.path.basename(path), problems)
+
+    # Names a run must supply from --var or the environment. Registers set by an
+    # earlier task and the {{ host.* }} / {{ now }} builtins are not "free".
+    registers = {t.get("register") for t in tasks if isinstance(t, dict) and t.get("register")}
+    free = sorted(free_names(doc) - set((doc.get("vars") or {}).keys()) - registers - {"host", "now"})
+    for name in free:
+        notes.append("variable {{ %s }} is not defined in vars: — supply it with --var %s=... "
+                     "or export %s" % (name, name, name))
+    return problems, notes
+
+
+def free_names(obj, acc=None, guarded=None):
+    """Every bare name referenced by any expression in the document, minus the
+    ones already guarded by `| default(...)` (those are legitimately optional)."""
+    top = acc is None
+    acc = set() if acc is None else acc
+    guarded = set() if guarded is None else guarded
+    if isinstance(obj, str):
+        for m in _TMPL_RE.finditer(obj):
+            try:
+                _walk_names(parse_expr(m.group(1).strip()), acc, guarded)
+            except TemplateError:
+                pass
+    elif isinstance(obj, list):
+        for o in obj:
+            free_names(o, acc, guarded)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            free_names(v, acc, guarded)
+    return (acc - guarded) if top else acc
+
+
+def _walk_names(node, acc, guarded):
+    if not isinstance(node, tuple):
+        return
+    if node[0] == "name":
+        acc.add(node[1])
+        return
+    if node[0] == "filter" and node[1] in ("default", "d") and node[2][0] == "name":
+        guarded.add(node[2][1])
+    for part in node[1:]:
+        if isinstance(part, tuple):
+            _walk_names(part, acc, guarded)
+        elif isinstance(part, list):
+            for p in part:
+                _walk_names(p, acc, guarded)
+
+
+# ============================================================================
+# Execution
+# ============================================================================
+# StrictHostKeyChecking=yes, not accept-new: this fleet roams between networks, and
+# trust-on-first-use on an untrusted one is exactly when you would accept an
+# impostor. Pin the host key on a network you trust — local81/bootstrap-fleet.sh
+# step 1b does it — and connections everywhere else verify against that pin.
+# CheckHostIP=no verifies the key against the host NAME rather than its address, so
+# a new DHCP lease is not mistaken for a man-in-the-middle.
+# L81_SSH_INSECURE=1 relaxes it to accept-new for enrolling a brand-new host.
+SSH_OPTS = ["-o", "BatchMode=yes",
+            "-o", ("StrictHostKeyChecking=accept-new"
+                   if os.environ.get("L81_SSH_INSECURE") == "1"
+                   else "StrictHostKeyChecking=yes"),
+            "-o", "CheckHostIP=no",
+            "-o", "ConnectTimeout=10"]
+
+SUDO_HINTS = ("password is required", "no tty present", "a terminal is required",
+              "not allowed to execute", "may not run sudo")
+
+
+def ssh_opts():
+    key = os.environ.get("L81_SSH_KEY", "")
+    return (["-i", key] if key else []) + SSH_OPTS
+
+
+def ssh_argv(host, remote_cmd):
+    return ["ssh"] + ssh_opts() + ["%s@%s" % (host["user"], host["address"]), "--", remote_cmd]
+
+
+def rsync_e():
+    return "ssh " + " ".join(shlex.quote(o) for o in ssh_opts())
+
+
+def shown(argv):
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+class Tally:
+    def __init__(self):
+        self.planned = self.changed = self.ok = self.skipped = self.failed = self.warned = 0
+        self.hosts = []
+
+
+class Runner:
+    def __init__(self, doc, path, cli_vars, apply_mode, assume_yes):
+        self.doc = doc
+        self.path = path
+        self.cli_vars = cli_vars
+        self.apply = apply_mode
+        self.yes = assume_yes
+        self.tally = Tally()
+        self.now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    # -- context ------------------------------------------------------------
+    def base_ctx(self):
+        """env < playbook vars < --var. Registers and builtins are layered on
+        top per host, and cannot be shadowed."""
+        ctx = {k: coerce_scalar(v) for k, v in os.environ.items() if IDENT_RE.match(k)}
+        for k, v in (self.doc.get("vars") or {}).items():
+            ctx[k] = v
+        ctx.update(self.cli_vars)
+        ctx["now"] = self.now
+        return ctx
+
+    def hosts(self, only=None):
+        ctx = self.base_ctx()
+        out = []
+        for h in self.doc.get("hosts") or []:
+            name = render(h.get("name"), ctx, "hosts.name")
+            if only and name != only:
+                continue
+            out.append({
+                "name": name,
+                "address": render(h.get("address"), ctx, "hosts.address"),
+                "user": render(h.get("user"), ctx, "hosts.user") if h.get("user")
+                        else os.environ.get("USER", "root"),
+            })
+        return out
+
+    # -- process helpers ----------------------------------------------------
+    def capture(self, argv, timeout=None, stdin_text=None):
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                               input=stdin_text)
+            return p.returncode, p.stdout, p.stderr
+        except subprocess.TimeoutExpired:
+            return 124, "", "local81: timed out after %ss" % timeout
+        except OSError as exc:
+            return 127, "", "local81: %s" % exc
+
+    def remote(self, host, command, become, timeout=None):
+        """Run `command` on the target through a single ssh invocation.
+        become wraps the WHOLE command in `sudo -n bash -c`, so a playbook that
+        already contains its own `sudo` (poplab-apply.yml does) still works."""
+        inner = "bash -c %s" % shlex.quote(command)
+        if become:
+            inner = "sudo -n " + inner
+        argv = ssh_argv(host, inner)
+        rc, out, errout = self.capture(argv, timeout=timeout)
+        if become and rc != 0 and any(h in errout.lower() for h in SUDO_HINTS):
+            err("passwordless sudo is not configured for %s@%s." % (host["user"], host["address"]))
+            err("  local81 is agentless and never types a password. On the target run:")
+            err("    echo '%s ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/90-local81-%s"
+                % (host["user"], host["user"]))
+            err("    sudo chmod 0440 /etc/sudoers.d/90-local81-%s" % host["user"])
+        return rc, out, errout
+
+    def reachable(self, host):
+        rc, _, errout = self.capture(ssh_argv(host, "true"))
+        if rc != 0:
+            err("%s (%s@%s) unreachable: %s"
+                % (host["name"], host["user"], host["address"],
+                   (errout.strip().splitlines() or ["ssh exited %d" % rc])[-1]))
+        return rc == 0
+
+    # -- task dispatch ------------------------------------------------------
+    def run_host(self, host):
+        head1("%s  %s@%s" % (host["name"], host["user"], host["address"]))
+        if self.apply and not self.reachable(host):
+            self.tally.failed += 1
+            self.tally.hosts.append((host["name"], "unreachable"))
+            return False
+        ctx = self.base_ctx()
+        ctx["host"] = dict(host)
+        host_ok = True
+        for i, task in enumerate(self.doc.get("tasks") or []):
+            kinds = [k for k in task if k in TASK_TYPES]
+            kind = kinds[0]
+            label = task.get("name") or "%s task %d" % (kind, i + 1)
+            where = "tasks[%d] (%s)" % (i, label)
+            try:
+                if not self.gate(task, ctx, where, label):
+                    continue
+                rc = self.dispatch(kind, task, ctx, host, label, where)
+            except TemplateError as exc:
+                err("%s: %s" % (label, exc))
+                rc = 1
+            if rc != 0:
+                if task.get("ignore_errors"):
+                    warn("%s failed (rc=%s) — ignore_errors: true, continuing" % (label, rc))
+                    self.tally.warned += 1
+                else:
+                    err("%s failed (rc=%s) — aborting this host" % (label, rc))
+                    self.tally.failed += 1
+                    host_ok = False
+                    break
+        self.tally.hosts.append((host["name"], "ok" if host_ok else "failed"))
+        return host_ok
+
+    def gate(self, task, ctx, where, label):
+        cond = task.get("when")
+        if cond is None and isinstance(task.get("pause"), dict):
+            cond = task["pause"].get("when")
+        if cond is None:
+            return True
+        if not render(cond, ctx, where + ".when"):
+            skip("%s (when is false)" % label)
+            self.tally.skipped += 1
+            return False
+        return True
+
+    def dispatch(self, kind, task, ctx, host, label, where):
+        head2(label)
+        body = render_deep(task[kind], ctx, where)
+        timeout = task.get("timeout")
+        if timeout is not None:
+            timeout = int(render(timeout, ctx, where + ".timeout"))
+        become = bool(task.get("become"))
+        handler = getattr(self, "task_" + kind)
+        return handler(body, task, ctx, host, timeout, become, label)
+
+    def record(self, task, ctx, rc, out, errout, dry_run=False):
+        reg = task.get("register")
+        if not reg:
+            return
+        ctx[reg] = {
+            "rc": rc,
+            "stdout": "<dry-run>" if dry_run else out.strip(),
+            "stderr": "<dry-run>" if dry_run else errout.strip(),
+        }
+
+    # -- tasks --------------------------------------------------------------
+    def task_shell(self, body, task, ctx, host, timeout, become, label):
+        inner = ("sudo -n " if become else "") + "bash -c " + shlex.quote(body)
+        argv = ssh_argv(host, inner)
+        if not self.apply:
+            dry(shown(argv))
+            self.tally.planned += 1
+            self.record(task, ctx, 0, "", "", dry_run=True)
+            return 0
+        info("$ %s" % body)
+        rc, out, errout = self.remote(host, body, become, timeout)
+        self.record(task, ctx, rc, out, errout)
+        for line in (out.strip().splitlines() if out.strip() else []):
+            log("      " + line)
+        if rc == 0:
+            ok("%s (rc=0)" % label)
+            if become:
+                self.tally.changed += 1
+            else:
+                self.tally.ok += 1
+        else:
+            for line in errout.strip().splitlines()[:10]:
+                log("      " + line, sys.stderr)
+        return rc
+
+    def task_sync(self, body, task, ctx, host, timeout, become, label):
+        argv = ["rsync", "-a", "--human-readable"]
+        for pattern in body.get("exclude") or []:
+            argv += ["--exclude", str(pattern)]
+        if body.get("delete"):
+            argv.append("--delete")
+        argv += ["-e", rsync_e(), body["src"],
+                 "%s@%s:%s" % (host["user"], host["address"], body["dest"])]
+        if not self.apply:
+            dry(shown(argv))
+            self.tally.planned += 1
+            return 0
+        rc, out, errout = self.capture(argv, timeout=timeout)
+        if rc == 0:
+            ok("synced %s -> %s:%s" % (body["src"], host["name"], body["dest"]))
+            self.tally.changed += 1
+        else:
+            for line in (errout or out).strip().splitlines()[:10]:
+                log("      " + line, sys.stderr)
+        return rc
+
+    def task_fetch(self, body, task, ctx, host, timeout, become, label):
+        src, dest = body["src"], body["dest"]
+        if isinstance(src, str) and (src.startswith("stdout:") or src.startswith("stderr:")):
+            stream, reg = src.split(":", 1)
+            if not self.apply:
+                dry("write %s from register %s.%s" % (dest, reg, stream))
+                self.tally.planned += 1
+                return 0
+            if reg not in ctx or not isinstance(ctx[reg], dict):
+                err("fetch: register %r has not been set by any earlier task" % reg)
+                return 1
+            content = ctx[reg].get(stream, "")
+            os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as fh:
+                fh.write(content + ("\n" if content and not content.endswith("\n") else ""))
+            ok("wrote %s (%d bytes from %s.%s)" % (dest, len(content), reg, stream))
+            self.tally.changed += 1
+            return 0
+        argv = ["rsync", "-a", "-e", rsync_e(),
+                "%s@%s:%s" % (host["user"], host["address"], src), dest]
+        if not self.apply:
+            dry(shown(argv))
+            self.tally.planned += 1
+            return 0
+        os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+        rc, out, errout = self.capture(argv, timeout=timeout)
+        if rc == 0:
+            ok("fetched %s:%s -> %s" % (host["name"], src, dest))
+            self.tally.changed += 1
+        else:
+            for line in (errout or out).strip().splitlines()[:10]:
+                log("      " + line, sys.stderr)
+        return rc
+
+    def task_package(self, body, task, ctx, host, timeout, become, label):
+        names = body["name"]
+        names = [names] if isinstance(names, str) else [str(n) for n in names]
+        quoted = " ".join(shlex.quote(n) for n in names)
+        check = "dpkg-query -W -f='${db:Status-Status}\\n' %s 2>/dev/null | grep -cx installed" % quoted
+        install = ("DEBIAN_FRONTEND=noninteractive apt-get install -y "
+                   "--no-install-recommends %s" % quoted)
+        if not self.apply:
+            dry(shown(ssh_argv(host, "sudo -n bash -c " + shlex.quote(install))))
+            dry("  (skipped when dpkg reports all %d package(s) already installed)" % len(names))
+            self.tally.planned += 1
+            return 0
+        rc, out, _ = self.remote(host, check, False, timeout)
+        if rc == 0 and out.strip() == str(len(names)):
+            skip("packages present: %s (already correct)" % " ".join(names))
+            self.tally.skipped += 1
+            return 0
+        info("$ %s" % install)
+        rc, out, errout = self.remote(host, install, True, timeout)
+        self.record(task, ctx, rc, out, errout)
+        if rc == 0:
+            ok("installed: %s" % " ".join(names))
+            self.tally.changed += 1
+        else:
+            for line in errout.strip().splitlines()[:10]:
+                log("      " + line, sys.stderr)
+        return rc
+
+    def task_pause(self, body, task, ctx, host, timeout, become, label):
+        prompt = body.get("prompt") if isinstance(body, dict) else str(body)
+        prompt = prompt or "Continue?"
+        if not self.apply:
+            dry("pause: would ask — %s" % prompt)
+            self.tally.planned += 1
+            return 0
+        if self.yes:
+            skip("pause: %s (auto-approved by --yes)" % prompt)
+            self.tally.skipped += 1
+            return 0
+        if not sys.stdin.isatty():
+            err("pause: not a tty and --yes not given; refusing: %s" % prompt)
+            return 1
+        try:
+            reply = input("%s  ?%s %s [y/N] " % (C_YEL, C_RST, prompt))
+        except EOFError:
+            reply = ""
+        if reply.strip().lower() in ("y", "yes"):
+            self.tally.ok += 1
+            return 0
+        err("pause: declined at the gate — stopping")
+        return 1
+
+    def task_debug(self, body, task, ctx, host, timeout, become, label):
+        msg = body.get("msg") if isinstance(body, dict) else body
+        for line in stringify(msg).rstrip("\n").splitlines():
+            info(line)
+        self.tally.ok += 1
+        return 0
+
+    # -- summary ------------------------------------------------------------
+    def summary(self):
+        t = self.tally
+        head2("Summary")
+        if self.apply:
+            log("  changed=%d  ok=%d  skipped=%d  warnings=%d  failures=%d"
+                % (t.changed, t.ok, t.skipped, t.warned, t.failed))
+        else:
+            log("  would run=%d  skipped=%d  warnings=%d  failures=%d"
+                % (t.planned, t.skipped, t.warned, t.failed))
+        for name, state in t.hosts:
+            glyph = {"ok": C_GRN + "✔", "failed": C_RED + "✘", "unreachable": C_RED + "✘"}[state]
+            log("  %s%s %-16s %s" % (glyph, C_RST, name, state))
+        if not self.apply:
+            log("  %sDRY RUN — no host was contacted. Re-run with --apply to execute.%s"
+                % (C_YEL, C_RST))
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+def usage():
+    lo, hi = _USAGE_RANGE
+    with open(os.path.abspath(__file__), "r", encoding="utf-8") as fh:
+        lines = fh.read().splitlines()[lo - 1:hi]
+    for line in lines:
+        print(re.sub(r"^# ?", "", line))
+
+
+def cmd_lint(path):
+    doc = load_playbook(path)
+    head1("lint %s" % path)
+    problems, notes = lint_playbook(doc, path)
+    for note in notes:
+        info(note)
+    for p in problems:
+        err(p)
+    if problems:
+        err("%d problem(s) in %s" % (len(problems), path))
+        return 1
+    ok("%s: %d host(s), %d task(s), dialect OK"
+       % (doc.get("name", path), len(doc.get("hosts") or []), len(doc.get("tasks") or [])))
+    return 0
+
+
+def cmd_hosts(path, cli_vars):
+    doc = load_playbook(path)
+    problems, _ = lint_playbook(doc, path)
+    if problems:
+        for p in problems:
+            err(p)
+        return 1
+    runner = Runner(doc, path, cli_vars, False, False)
+    head1("hosts in %s" % doc.get("name", path))
+    for h in runner.hosts():
+        log("  %-16s %s@%s" % (h["name"], h["user"], h["address"]))
+    return 0
+
+
+def cmd_run(path, cli_vars, only_host, apply_mode, assume_yes):
+    doc = load_playbook(path)
+    problems, _ = lint_playbook(doc, path)
+    if problems:
+        for p in problems:
+            err(p)
+        die("refusing to run a playbook that does not lint: %s" % path)
+    runner = Runner(doc, path, cli_vars, apply_mode, assume_yes)
+    head1("local81 %s — %s" % ("apply" if apply_mode else "dry run", doc.get("name", path)))
+    if doc.get("description"):
+        info(doc["description"])
+    hosts = runner.hosts(only_host)
+    if not hosts:
+        die("no host named %r in %s" % (only_host, path), 64)
+    failed = 0
+    for host in hosts:
+        try:
+            if not runner.run_host(host):
+                failed += 1
+        except TemplateError as exc:
+            err("%s: %s" % (host["name"], exc))
+            runner.tally.failed += 1
+            runner.tally.hosts.append((host["name"], "failed"))
+            failed += 1
+    runner.summary()
+    return 1 if failed or runner.tally.failed else 0
+
+
+def main(argv):
+    global QUIET
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage()
+        return 0
+    if argv[0] in ("-V", "--version"):
+        print("local81 %s" % LOCAL81_VERSION)
+        return 0
+
+    cmd, rest = argv[0], argv[1:]
+    cli_vars, only_host, apply_mode, assume_yes, positional = {}, None, False, False, []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--var":
+            if i + 1 >= len(rest) or "=" not in rest[i + 1]:
+                die("--var needs K=V", 64)
+            k, v = rest[i + 1].split("=", 1)
+            cli_vars[k] = coerce_scalar(v)
+            i += 2
+        elif a.startswith("--var="):
+            k, v = a[6:].split("=", 1)
+            cli_vars[k] = coerce_scalar(v)
+            i += 1
+        elif a == "--host":
+            if i + 1 >= len(rest):
+                die("--host needs a name", 64)
+            only_host = rest[i + 1]
+            i += 2
+        elif a == "--apply":
+            apply_mode = True
+            i += 1
+        elif a == "--check":
+            apply_mode = False
+            i += 1
+        elif a in ("--yes", "-y"):
+            assume_yes = True
+            i += 1
+        elif a in ("--quiet", "-q"):
+            QUIET = True
+            i += 1
+        elif a in ("-h", "--help"):
+            usage()
+            return 0
+        elif a.startswith("-"):
+            die("unknown flag: %s" % a, 64)
+        else:
+            positional.append(a)
+            i += 1
+
+    if cmd not in ("run", "lint", "hosts"):
+        err("unknown command: %s" % cmd)
+        usage()
+        return 64
+    if not positional:
+        die("%s needs a playbook path" % cmd, 64)
+    path = positional[0]
+
+    try:
+        if cmd == "lint":
+            rc = 0
+            for p in positional:
+                rc |= cmd_lint(p)
+            return rc
+        if cmd == "hosts":
+            return cmd_hosts(path, cli_vars)
+        return cmd_run(path, cli_vars, only_host, apply_mode, assume_yes)
+    except LintError as exc:
+        die(str(exc))
+    except TemplateError as exc:
+        die(str(exc))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:  # pragma: no cover
+        err("interrupted")
+        sys.exit(130)
